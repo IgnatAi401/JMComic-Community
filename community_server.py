@@ -27,7 +27,12 @@ BASE_PATH = "/jm/api"
 MAX_BODY_BYTES = 4 * 1024
 ONLINE_TTL = 150          # seconds without a heartbeat before a client counts as offline
 SAMPLE_INTERVAL = 60      # seconds between online samples for the hourly history
-MAX_HISTORY_HOURS = 24 * 90
+HOUR = 3600
+DAY = 86400
+DAY_OFFSET = 8 * HOUR     # calendar days are cut at midnight Beijing time (UTC+8, no DST)
+# History ranges: bucket size and bucket count (None = since the first sample).
+RANGES = {"day": (HOUR, 24), "week": (HOUR, 24 * 7), "month": (DAY, 30), "all": (DAY, None)}
+MAX_ALL_DAYS = 366 * 10
 PAGE_SIZE = 24
 MAX_PAGE = 500
 HOT_GRAVITY = 0.8
@@ -77,6 +82,18 @@ CREATE TABLE IF NOT EXISTS online_hours (
     peak        INTEGER NOT NULL DEFAULT 0,
     unique_ids  INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS online_days (
+    day_start   INTEGER PRIMARY KEY,
+    visitors    INTEGER NOT NULL DEFAULT 0
+);
+-- Hashed IDs seen in the current hour and day only, so a restart keeps counting;
+-- rows from earlier periods are deleted as soon as the period ends.
+CREATE TABLE IF NOT EXISTS online_seen (
+    scope   TEXT NOT NULL,
+    start   INTEGER NOT NULL,
+    client  TEXT NOT NULL,
+    PRIMARY KEY (scope, start, client)
+);
 CREATE INDEX IF NOT EXISTS comics_last ON comics (hidden, last_at DESC);
 CREATE INDEX IF NOT EXISTS comics_top ON comics (hidden, recommenders DESC, last_at DESC);
 """
@@ -103,6 +120,17 @@ def comic_key(raw: object) -> str:
     return value.lstrip("0") or "0"
 
 
+def hour_start(now: float) -> int:
+    return int(now // HOUR * HOUR)
+
+
+def day_start(now: float) -> int:
+    return int((now + DAY_OFFSET) // DAY * DAY - DAY_OFFSET)
+
+
+PERIODS = {"hour": hour_start, "day": day_start}
+
+
 def open_db(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
@@ -119,21 +147,29 @@ class Community:
         self.db_lock = threading.Lock()
         self.online: dict[str, float] = {}
         self.online_lock = threading.Lock()
-        self.hour_start = 0
-        self.hour_clients: set[str] = set()
+        # Unique visitors per period: scope -> [period start, hashed IDs seen in it].
+        self.seen: dict[str, list] = {scope: [0, set()] for scope in PERIODS}
+        self._load_seen()
 
     # ---- online ----
 
     def heartbeat(self, client: str, leaving: bool) -> int:
         now = time.time()
+        new: list[tuple] = []
         with self.online_lock:
             if leaving:
                 self.online.pop(client, None)
             else:
                 self.online[client] = now
-                self._roll_hour(now)
-                self.hour_clients.add(client)
-            return self._count(now)
+                rolled = self._roll(now)
+                for scope, (start, clients) in self.seen.items():
+                    if client not in clients:
+                        clients.add(client)
+                        new.append((scope, start, client))
+            count = self._count(now)
+        if not leaving:
+            self._save_seen(new, rolled)
+        return count
 
     def online_count(self) -> int:
         with self.online_lock:
@@ -146,20 +182,46 @@ class Community:
             del self.online[key]
         return len(self.online)
 
-    def _roll_hour(self, now: float) -> None:
-        hour = int(now // 3600 * 3600)
-        if hour != self.hour_start:
-            self.hour_start = hour
-            self.hour_clients = set()
+    def _roll(self, now: float) -> bool:
+        """Start a fresh visitor set for every period that has ended; True if any did."""
+        rolled = False
+        for scope, period in self.seen.items():
+            start = PERIODS[scope](now)
+            if period[0] != start:
+                period[0], period[1] = start, set()
+                rolled = True
+        return rolled
+
+    def _load_seen(self) -> None:
+        now = time.time()
+        self._roll(now)
+        with self.db_lock:
+            for scope, (start, clients) in self.seen.items():
+                clients.update(row[0] for row in self.db.execute(
+                    "SELECT client FROM online_seen WHERE scope = ? AND start = ?", (scope, start)
+                ))
+        self._save_seen([], True)
+
+    def _save_seen(self, new: list[tuple], rolled: bool) -> None:
+        if not new and not rolled:
+            return
+        with self.db_lock:
+            if new:
+                self.db.executemany("INSERT OR IGNORE INTO online_seen (scope, start, client) VALUES (?, ?, ?)", new)
+            if rolled:
+                now = time.time()
+                for scope, start_of in PERIODS.items():
+                    self.db.execute("DELETE FROM online_seen WHERE scope = ? AND start < ?", (scope, start_of(now)))
 
     def sample(self) -> None:
-        """Add one online sample to the current hour (called once a minute)."""
+        """Add one online sample to the current hour and day (called once a minute)."""
         now = time.time()
         with self.online_lock:
-            self._roll_hour(now)
+            rolled = self._roll(now)
             count = self._count(now)
-            hour = self.hour_start
-            unique = len(self.hour_clients)
+            (hour, hour_ids), (day, day_ids) = self.seen["hour"], self.seen["day"]
+            hour_visitors, day_visitors = len(hour_ids), len(day_ids)
+        self._save_seen([], rolled)
         with self.db_lock:
             self.db.execute(
                 """INSERT INTO online_hours (hour_start, sample_sum, samples, peak, unique_ids)
@@ -169,24 +231,60 @@ class Community:
                      samples = samples + 1,
                      peak = MAX(peak, excluded.peak),
                      unique_ids = MAX(unique_ids, excluded.unique_ids)""",
-                (hour, count, count, unique),
+                (hour, count, count, hour_visitors),
+            )
+            self.db.execute(
+                """INSERT INTO online_days (day_start, visitors) VALUES (?, ?)
+                   ON CONFLICT(day_start) DO UPDATE SET visitors = MAX(visitors, excluded.visitors)""",
+                (day, day_visitors),
             )
 
-    def history(self, hours: int) -> list[dict]:
-        since = int(time.time() // 3600 * 3600) - (hours - 1) * 3600
+    def today_visitors(self) -> int:
+        with self.online_lock:
+            self._roll(time.time())
+            return len(self.seen["day"][1])
+
+    def history(self, range_name: str) -> dict:
+        """Evenly spaced buckets for the range; a bucket without samples has null values."""
+        step, count = RANGES[range_name]
+        now = time.time()
+        end = hour_start(now) if step == HOUR else day_start(now)
         with self.db_lock:
-            rows = self.db.execute(
-                "SELECT * FROM online_hours WHERE hour_start >= ? ORDER BY hour_start", (since,)
-            ).fetchall()
-        return [
-            {
-                "hour": row["hour_start"],
-                "average": round(row["sample_sum"] / row["samples"], 2) if row["samples"] else 0,
-                "peak": row["peak"],
-                "unique": row["unique_ids"],
-            }
-            for row in rows
-        ]
+            if count is None:
+                first = self.db.execute("SELECT MIN(hour_start) FROM online_hours").fetchone()[0]
+                start = max(day_start(first) if first is not None else end, end - (MAX_ALL_DAYS - 1) * DAY)
+            else:
+                start = end - (count - 1) * step
+            if step == HOUR:
+                rows = self.db.execute(
+                    """SELECT hour_start AS t, sample_sum, samples, peak, unique_ids AS visitors
+                       FROM online_hours WHERE hour_start >= ?""",
+                    (start,),
+                ).fetchall()
+                buckets = {row["t"]: dict(row) for row in rows}
+            else:
+                rows = self.db.execute(
+                    """SELECT (hour_start + :off) / 86400 * 86400 - :off AS t,
+                              SUM(sample_sum) AS sample_sum, SUM(samples) AS samples, MAX(peak) AS peak
+                       FROM online_hours WHERE hour_start >= :start GROUP BY t""",
+                    {"off": DAY_OFFSET, "start": start},
+                ).fetchall()
+                buckets = {row["t"]: dict(row) for row in rows}
+                for row in self.db.execute(
+                    "SELECT day_start, visitors FROM online_days WHERE day_start >= ?", (start,)
+                ):
+                    buckets.setdefault(row["day_start"], {})["visitors"] = row["visitors"]
+        points = []
+        for t in range(start, end + 1, step):
+            row = buckets.get(t, {})
+            samples = row.get("samples")
+            points.append({
+                "t": t,
+                "average": round(row["sample_sum"] / samples, 2) if samples else None,
+                "peak": row.get("peak") if samples else None,
+                "visitors": row.get("visitors"),
+            })
+        return {"range": range_name, "step": step, "points": points}
 
     # ---- recommendations ----
 
@@ -394,8 +492,11 @@ def make_handler(community: Community):
             if route == "/online" and method == "GET":
                 return {"online": community.online_count()}
             if route == "/stats" and method == "GET":
-                hours = int_arg(query.get("hours"), 24 * 7, 1, MAX_HISTORY_HOURS)
-                return {"online": community.online_count(), "hours": community.history(hours)}
+                range_name = query.get("range") or "week"
+                if range_name not in RANGES:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid range")
+                return {"online": community.online_count(), "today": community.today_visitors(),
+                        **community.history(range_name)}
             if route == "/recommendations" and method == "GET":
                 sort = query.get("sort", "hot")
                 if sort not in {"hot", "new", "top"}:
