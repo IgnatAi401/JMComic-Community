@@ -19,7 +19,7 @@ def show(conn, hidden: bool) -> None:
     for row in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(row["last_at"]))
         print(f"{row['comic_id']:>10}  推荐 {row['recommenders']:>3}  好看 {row['good']:>3}  "
-              f"不好看 {row['bad']:>3}  欢乐 {row['fun']:>3}  最近 {when}")
+              f"不好看 {row['bad']:>3}  最近 {when}")
 
 
 def main() -> None:

@@ -36,6 +36,9 @@ CLIENT_ID = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 COMIC_ID = re.compile(r"^[0-9]{1,12}$")
 VOTES = {"good": 1, "bad": -1, None: 0}
 VOTE_NAMES = {1: "good", -1: "bad", 0: None}
+# Emoji reactions, by stable key; the frontends map each key to its emoji.
+REACTIONS = ("love", "hot", "lol", "mindblown", "think", "cry", "angry",
+             "fire", "zap", "cow", "chicken", "milk", "nails", "zero")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS comics (
@@ -45,7 +48,6 @@ CREATE TABLE IF NOT EXISTS comics (
     recommenders INTEGER NOT NULL DEFAULT 0,
     good         INTEGER NOT NULL DEFAULT 0,
     bad          INTEGER NOT NULL DEFAULT 0,
-    fun          INTEGER NOT NULL DEFAULT 0,
     hidden       INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS recommends (
@@ -58,9 +60,15 @@ CREATE TABLE IF NOT EXISTS votes (
     comic_id   TEXT NOT NULL,
     client     TEXT NOT NULL,
     vote       INTEGER NOT NULL DEFAULT 0,
-    fun        INTEGER NOT NULL DEFAULT 0,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY (comic_id, client)
+);
+CREATE TABLE IF NOT EXISTS reactions (
+    comic_id   TEXT NOT NULL,
+    client     TEXT NOT NULL,
+    reaction   TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (comic_id, client, reaction)
 );
 CREATE TABLE IF NOT EXISTS online_hours (
     hour_start  INTEGER PRIMARY KEY,
@@ -205,39 +213,49 @@ class Community:
                 raise
             return self._item(comic, client)
 
-    def vote(self, client: str, comic: str, vote: int, fun: bool) -> dict:
+    def vote(self, client: str, comic: str, vote: int) -> dict:
         now = int(time.time())
         with self.db_lock:
-            exists = self.db.execute("SELECT 1 FROM comics WHERE comic_id = ? AND hidden = 0", (comic,)).fetchone()
-            if not exists:
-                raise ApiError(HTTPStatus.NOT_FOUND, "not recommended")
+            self._require(comic)
             self.db.execute("BEGIN IMMEDIATE")
             try:
                 old = self.db.execute(
-                    "SELECT vote, fun FROM votes WHERE comic_id = ? AND client = ?", (comic, client)
+                    "SELECT vote FROM votes WHERE comic_id = ? AND client = ?", (comic, client)
                 ).fetchone()
-                old_vote, old_fun = (old["vote"], old["fun"]) if old else (0, 0)
-                new_fun = int(fun)
+                old_vote = old["vote"] if old else 0
                 self.db.execute(
-                    """INSERT INTO votes (comic_id, client, vote, fun, updated_at) VALUES (?, ?, ?, ?, ?)
+                    """INSERT INTO votes (comic_id, client, vote, updated_at) VALUES (?, ?, ?, ?)
                        ON CONFLICT(comic_id, client) DO UPDATE SET
-                         vote = excluded.vote, fun = excluded.fun, updated_at = excluded.updated_at""",
-                    (comic, client, vote, new_fun, now),
+                         vote = excluded.vote, updated_at = excluded.updated_at""",
+                    (comic, client, vote, now),
                 )
                 self.db.execute(
-                    "UPDATE comics SET good = good + ?, bad = bad + ?, fun = fun + ? WHERE comic_id = ?",
-                    (
-                        (vote == 1) - (old_vote == 1),
-                        (vote == -1) - (old_vote == -1),
-                        new_fun - old_fun,
-                        comic,
-                    ),
+                    "UPDATE comics SET good = good + ?, bad = bad + ? WHERE comic_id = ?",
+                    ((vote == 1) - (old_vote == 1), (vote == -1) - (old_vote == -1), comic),
                 )
                 self.db.execute("COMMIT")
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
             return self._item(comic, client)
+
+    def react(self, client: str, comic: str, reaction: str, on: bool) -> dict:
+        with self.db_lock:
+            self._require(comic)
+            if on:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO reactions (comic_id, client, reaction, created_at) VALUES (?, ?, ?, ?)",
+                    (comic, client, reaction, int(time.time())),
+                )
+            else:
+                self.db.execute(
+                    "DELETE FROM reactions WHERE comic_id = ? AND client = ? AND reaction = ?", (comic, client, reaction)
+                )
+            return self._item(comic, client)
+
+    def _require(self, comic: str) -> None:
+        if not self.db.execute("SELECT 1 FROM comics WHERE comic_id = ? AND hidden = 0", (comic,)).fetchone():
+            raise ApiError(HTTPStatus.NOT_FOUND, "not recommended")
 
     def comic(self, comic: str, client: str | None) -> dict:
         with self.db_lock:
@@ -259,9 +277,11 @@ class Community:
                     f"SELECT * FROM comics WHERE hidden = 0 ORDER BY {order} LIMIT ? OFFSET ?",
                     (PAGE_SIZE, offset),
                 ).fetchall()
-            mine = self._mine([row["comic_id"] for row in rows], client)
+            ids = [row["comic_id"] for row in rows]
+            mine = self._mine(ids, client)
+            counts = self._reactions(ids)
         return {
-            "items": [serialize(row, mine.get(row["comic_id"])) for row in rows],
+            "items": [serialize(row, mine.get(row["comic_id"]), counts.get(row["comic_id"])) for row in rows],
             "total": total,
             "page": page,
             "pageSize": PAGE_SIZE,
@@ -270,44 +290,62 @@ class Community:
     def _item(self, comic: str, client: str | None) -> dict:
         row = self.db.execute("SELECT * FROM comics WHERE comic_id = ? AND hidden = 0", (comic,)).fetchone()
         if row is None:
-            return {"id": comic, "recommenders": 0, "good": 0, "bad": 0, "fun": 0,
-                    "firstAt": None, "lastAt": None,
-                    "mine": {"recommended": False, "vote": None, "fun": False}}
-        return serialize(row, self._mine([comic], client).get(comic))
+            return {"id": comic, "recommenders": 0, "good": 0, "bad": 0, "reactions": {},
+                    "firstAt": None, "lastAt": None, "mine": empty_mine()}
+        return serialize(row, self._mine([comic], client).get(comic), self._reactions([comic]).get(comic))
 
     def _mine(self, comics: list[str], client: str | None) -> dict[str, dict]:
         if not client or not comics:
             return {}
         marks = ",".join("?" * len(comics))
-        result = {comic: {"recommended": False, "vote": None, "fun": False} for comic in comics}
+        result = {comic: empty_mine() for comic in comics}
         for row in self.db.execute(
             f"SELECT comic_id FROM recommends WHERE client = ? AND comic_id IN ({marks})", (client, *comics)
         ):
             result[row["comic_id"]]["recommended"] = True
         for row in self.db.execute(
-            f"SELECT comic_id, vote, fun FROM votes WHERE client = ? AND comic_id IN ({marks})", (client, *comics)
+            f"SELECT comic_id, vote FROM votes WHERE client = ? AND comic_id IN ({marks})", (client, *comics)
         ):
             result[row["comic_id"]]["vote"] = VOTE_NAMES.get(row["vote"])
-            result[row["comic_id"]]["fun"] = bool(row["fun"])
+        for row in self.db.execute(
+            f"SELECT comic_id, reaction FROM reactions WHERE client = ? AND comic_id IN ({marks})", (client, *comics)
+        ):
+            result[row["comic_id"]]["reactions"].append(row["reaction"])
+        return result
+
+    def _reactions(self, comics: list[str]) -> dict[str, dict[str, int]]:
+        if not comics:
+            return {}
+        marks = ",".join("?" * len(comics))
+        result: dict[str, dict[str, int]] = {}
+        for row in self.db.execute(
+            f"SELECT comic_id, reaction, COUNT(*) AS n FROM reactions WHERE comic_id IN ({marks}) GROUP BY comic_id, reaction",
+            comics,
+        ):
+            result.setdefault(row["comic_id"], {})[row["reaction"]] = row["n"]
         return result
 
 
 def hot_score(row: sqlite3.Row, now: float) -> float:
-    points = row["recommenders"] * 3 + row["good"] - row["bad"] + row["fun"] * 0.5
+    points = row["recommenders"] * 3 + row["good"] - row["bad"]
     hours = max(0.0, (now - row["last_at"]) / 3600)
     return points / math.pow(hours + 2, HOT_GRAVITY)
 
 
-def serialize(row: sqlite3.Row, mine: dict | None) -> dict:
+def empty_mine() -> dict:
+    return {"recommended": False, "vote": None, "reactions": []}
+
+
+def serialize(row: sqlite3.Row, mine: dict | None, reactions: dict | None = None) -> dict:
     return {
         "id": row["comic_id"],
         "recommenders": row["recommenders"],
         "good": row["good"],
         "bad": row["bad"],
-        "fun": row["fun"],
+        "reactions": reactions or {},
         "firstAt": row["first_at"],
         "lastAt": row["last_at"],
-        "mine": mine or {"recommended": False, "vote": None, "fun": False},
+        "mine": mine or empty_mine(),
     }
 
 
@@ -372,8 +410,13 @@ def make_handler(community: Community):
                 vote = body.get("vote")
                 if vote not in VOTES:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "invalid vote")
-                return community.vote(
-                    client_key(body.get("client")), comic_key(body.get("comic")), VOTES[vote], bool(body.get("fun"))
+                return community.vote(client_key(body.get("client")), comic_key(body.get("comic")), VOTES[vote])
+            if route == "/react" and method == "POST":
+                reaction = body.get("reaction")
+                if reaction not in REACTIONS:
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "invalid reaction")
+                return community.react(
+                    client_key(body.get("client")), comic_key(body.get("comic")), reaction, body.get("on") is not False
                 )
             raise ApiError(HTTPStatus.NOT_FOUND, "not found")
 
