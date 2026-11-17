@@ -1,0 +1,9 @@
+[project]
+name = "jmcomic-community"
+version = "0.1.0"
+description = "Anonymous online counter and shared recommendation list for JMComic Next / Web"
+requires-python = ">=3.10"
+dependencies = []
+
+[tool.uv]
+package = false

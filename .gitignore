@@ -1,0 +1,13 @@
+# 数据库（推荐、投票、在线历史）
+/data/
+
+__pycache__/
+*.py[cod]
+.venv/
+*.sqlite3
+*.sqlite3-*
+*.log
+.DS_Store
+._*
+Icon?
+AGENTS.md
